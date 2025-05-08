@@ -3,6 +3,7 @@ import argparse
 import sys
 import yaml
 import time
+import json
 from openai import AzureOpenAI
 from azure.identity import AzureCliCredential, DefaultAzureCredential, get_bearer_token_provider
 
@@ -94,6 +95,7 @@ def main():
         "--additional", help="Path to additional content to append to prompt"
     )
     parser.add_argument("--output", required=True, help="Path to save the response")
+    parser.add_argument("--format", help="Optional format for the response (e.g., 'markdown')")
     args = parser.parse_args()
 
     # Load configuration
@@ -113,7 +115,7 @@ def main():
         "max_completion_tokens", 10000
     )  # Default if not specified
     reasoning_effort = azure_config.get(
-        "reasoning_effort", "medium"
+        "reasoning_effort", "none"
     )  # Default if not specified
 
     # Load prompt
@@ -136,17 +138,65 @@ def main():
 
     start_time = time.time()
     try:
-        response = client.chat.completions.create(
-            model=azure_config["deployment_name"],
-            messages=[
+        # Prepare arguments for the API call
+        api_args = {
+            "model": azure_config["deployment_name"],
+            "messages": [
                 {"role": "user", "content": prompt_text},
             ],
-            max_completion_tokens=max_completion_tokens,
-            extra_body={"reasoning_effort": reasoning_effort},
-        )
+            "max_completion_tokens": max_completion_tokens,
+            # functions and function_call will be added conditionally below
+        }
+
+        # Conditionally add function calling for specific formats
+        if args.format == "markdown":
+            print("Requesting response formatted as Markdown using function calling.")
+            api_args["functions"] = [
+                {
+                    "name": "return_as_markdown",
+                    "description": "Wrap the response in a Markdown string",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "markdown": {
+                                "type": "string",
+                                "description": "The full response in valid GitHub-style Markdown"
+                            }
+                        },
+                        "required": ["markdown"]
+                    }
+                }
+            ]
+            api_args["function_call"] = {"name": "return_as_markdown"}
+
+        # Conditionally add extra_body if reasoning_effort is not "none"
+        if reasoning_effort and reasoning_effort != "none":
+            api_args["extra_body"] = {"reasoning_effort": reasoning_effort}
+            print(f"Using reasoning_effort: {reasoning_effort}")
+        else:
+             print("reasoning_effort is set to 'none', skipping extra_body.")
+
+
+        response = client.chat.completions.create(**api_args)
 
         # Extract response text
-        response_text = response.choices[0].message.content
+        response_text = ""
+        # Check if a function call was requested and returned
+        if args.format == "markdown" and response.choices[0].message.function_call:
+            try:
+                function_args = json.loads(response.choices[0].message.function_call.arguments)
+                response_text = function_args.get("markdown", "Error: 'markdown' argument not found in function call.")
+            except json.JSONDecodeError as json_err:
+                 response_text = f"Error decoding function call arguments: {json_err}\nRaw arguments: {response.choices[0].message.function_call.arguments}"
+            except Exception as e:
+                 response_text = f"Error processing function call: {e}"
+        elif response.choices[0].message.content:
+             # Handle regular text response
+             response_text = response.choices[0].message.content
+        else:
+             # Fallback if no content or expected function call is present
+             response_text = "Error: No content or expected function call in response."
+
 
         # Print usage information
         print("\nUsage Information:")
